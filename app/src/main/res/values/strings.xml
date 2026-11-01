@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Smart Organizer</string>
+    <string name="watch_channel_name">Folder watch</string>
+    <string name="watch_notification_title">Watching inbox</string>
+    <string name="watch_notification_text">New files are classified offline with Gemma 4</string>
+</resources>
