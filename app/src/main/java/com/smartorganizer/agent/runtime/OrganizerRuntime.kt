@@ -11,9 +11,12 @@ import java.util.concurrent.ConcurrentHashMap
 import com.smartorganizer.agent.files.DocumentPreview
 import com.smartorganizer.agent.files.FileOrganizer
 import com.smartorganizer.agent.files.InboxScanner
+import com.smartorganizer.agent.files.NoTextFallback
 import com.smartorganizer.agent.llm.DownloadStatus
 import com.smartorganizer.agent.llm.GemmaClassifier
+import com.smartorganizer.agent.llm.ModelCatalog
 import com.smartorganizer.agent.llm.ModelDownloader
+import com.smartorganizer.agent.llm.OrganizerModel
 import com.smartorganizer.agent.service.OrganizerService
 import java.util.concurrent.Executors
 import kotlin.coroutines.cancellation.CancellationException
@@ -52,7 +55,13 @@ class OrganizerRuntime(private val app: Application) {
     val uiState: StateFlow<OrganizerUiState> = _uiState.asStateFlow()
 
     init {
-        refreshModelStatus()
+        ioScope.launch {
+            preferences.selectedModelId.collect { id ->
+                val model = ModelCatalog.byId(id)
+                _uiState.update { it.copy(selectedModel = model, downloadTotal = model.expectedBytes) }
+                refreshModelStatus()
+            }
+        }
         ioScope.launch {
             preferences.watchFolderUri.collect { uri ->
                 val name = uri?.let { DocumentFile.fromTreeUri(app, Uri.parse(it))?.name }
@@ -75,20 +84,44 @@ class OrganizerRuntime(private val app: Application) {
     }
 
     fun refreshModelStatus() {
-        when (val status = downloader.currentStatus()) {
+        val model = _uiState.value.selectedModel
+        when (val status = downloader.currentStatus(model)) {
             is DownloadStatus.Ready -> _uiState.update {
                 it.copy(
                     modelReady = true,
-                    statusMessage = "Gemma 4 E2B is on this phone. Start watching to load it.",
+                    statusMessage = "${model.displayName} is on this phone. Start watching to load it.",
                 )
             }
             else -> _uiState.update {
                 it.copy(
                     modelReady = false,
                     engineReady = false,
-                    statusMessage = "Download Gemma 4 E2B once (${com.smartorganizer.agent.llm.ModelCatalog.DISPLAY_SIZE}). After that, sorting stays offline.",
+                    statusMessage = "Download ${model.displayName} once (${model.displaySize}). ML Kit reads text; the model picks the folder.",
                 )
             }
+        }
+    }
+
+    fun setSelectedModel(model: OrganizerModel) {
+        if (_uiState.value.downloading) return
+        if (_uiState.value.watching) {
+            recordFailure("Stop watching before switching models.")
+            return
+        }
+        ioScope.launch {
+            withContext(llmDispatcher) {
+                llmMutex.withLock { classifier.close() }
+            }
+            preferences.setSelectedModelId(model.id)
+            _uiState.update {
+                it.copy(
+                    selectedModel = model,
+                    engineReady = false,
+                    downloadTotal = model.expectedBytes,
+                    errorMessage = null,
+                )
+            }
+            refreshModelStatus()
         }
     }
 
@@ -103,27 +136,39 @@ class OrganizerRuntime(private val app: Application) {
 
     fun startDownload() {
         if (_uiState.value.downloading) return
+        val model = _uiState.value.selectedModel
         _uiState.update {
-            it.copy(downloading = true, errorMessage = null, statusMessage = "Downloading Gemma 4 E2B…")
+            it.copy(
+                downloading = true,
+                errorMessage = null,
+                downloadTotal = model.expectedBytes,
+                statusMessage = "Downloading ${model.displayName}…",
+            )
         }
         ioScope.launch {
-            downloader.download(_uiState.value.huggingFaceToken).collect { status ->
-                handleDownloadStatus(status)
+            downloader.download(model, _uiState.value.huggingFaceToken).collect { status ->
+                handleDownloadStatus(model, status)
             }
         }
     }
 
     fun importModel(uri: Uri) {
         if (_uiState.value.downloading) return
+        val model = _uiState.value.selectedModel
         _uiState.update {
-            it.copy(downloading = true, errorMessage = null, statusMessage = "Copying Gemma 4 E2B onto the phone…")
+            it.copy(
+                downloading = true,
+                errorMessage = null,
+                downloadTotal = model.expectedBytes,
+                statusMessage = "Copying ${model.displayName} onto the phone…",
+            )
         }
         ioScope.launch {
             runCatching {
-                downloader.importFrom(uri).collect { status -> handleDownloadStatus(status) }
+                downloader.importFrom(model, uri).collect { status -> handleDownloadStatus(model, status) }
             }.onFailure { error ->
                 _uiState.update { it.copy(downloading = false) }
-                recordFailure("Could not import Gemma 4 E2B", error)
+                recordFailure("Could not import ${model.displayName}", error)
             }
         }
     }
@@ -135,7 +180,7 @@ class OrganizerRuntime(private val app: Application) {
     fun startWatching() {
         val state = _uiState.value
         if (!state.modelReady) {
-            recordFailure("Download Gemma 4 E2B first.")
+            recordFailure("Download ${state.selectedModel.displayName} first.")
             return
         }
         if (state.watchFolderUri.isNullOrBlank()) {
@@ -192,21 +237,22 @@ class OrganizerRuntime(private val app: Application) {
     fun ensureEngineLoaded() {
         llmScope.launch {
             llmMutex.withLock {
-                if (classifier.isReady) {
+                val model = _uiState.value.selectedModel
+                val path = downloader.modelFile(model).absolutePath
+                if (classifier.isLoaded(path)) {
                     _uiState.update { it.copy(engineReady = true) }
                     return@withLock
                 }
-                val path = downloader.modelFile().absolutePath
                 _uiState.update {
-                    it.copy(engineBusy = true, statusMessage = "Loading Gemma 4 E2B into memory…")
+                    it.copy(engineBusy = true, statusMessage = "Loading ${model.displayName} into memory…")
                 }
                 try {
-                    classifier.load(path, app.cacheDir.path)
+                    classifier.load(model, path, app.cacheDir.path)
                     _uiState.update {
                         it.copy(
                             engineReady = true,
                             engineBusy = false,
-                            statusMessage = "Gemma 4 is ready. New inbox files will be sorted by meaning.",
+                            statusMessage = "${model.displayName} is ready. New inbox files will be sorted by meaning.",
                             errorMessage = null,
                         )
                     }
@@ -214,7 +260,7 @@ class OrganizerRuntime(private val app: Application) {
                     _uiState.update {
                         it.copy(engineReady = false, engineBusy = false)
                     }
-                    recordFailure("Could not load Gemma 4 E2B", error)
+                    recordFailure("Could not load ${model.displayName}", error)
                 }
             }
         }
@@ -263,24 +309,32 @@ class OrganizerRuntime(private val app: Application) {
         try {
             preview = withContext(Dispatchers.IO) { previewer.prepare(file) }
             val currentPreview = preview
-            val classification = withContext(llmDispatcher) {
-                llmMutex.withLock {
-                    if (!classifier.isReady) {
-                        classifier.load(downloader.modelFile().absolutePath, app.cacheDir.path)
-                        _uiState.update { it.copy(engineReady = true) }
-                    }
-                    _uiState.update {
-                        it.copy(
-                            engineBusy = true,
-                            statusMessage = "Gemma 4 is classifying ${currentPreview.displayName}…",
+            val model = _uiState.value.selectedModel
+            val classification = if (
+                !model.supportsVision && currentPreview.extractedText.trim().length < MIN_OCR_CHARS
+            ) {
+                NoTextFallback.classify(currentPreview.displayName, currentPreview.mimeType)
+            } else {
+                withContext(llmDispatcher) {
+                    llmMutex.withLock {
+                        val path = downloader.modelFile(model).absolutePath
+                        if (!classifier.isLoaded(path)) {
+                            classifier.load(model, path, app.cacheDir.path)
+                            _uiState.update { it.copy(engineReady = true) }
+                        }
+                        _uiState.update {
+                            it.copy(
+                                engineBusy = true,
+                                statusMessage = "${model.displayName} is classifying ${currentPreview.displayName}…",
+                            )
+                        }
+                        classifier.classify(
+                            fileName = currentPreview.displayName,
+                            mimeType = currentPreview.mimeType,
+                            imagePaths = currentPreview.imagePaths,
+                            extractedText = currentPreview.extractedText,
                         )
                     }
-                    classifier.classify(
-                        fileName = currentPreview.displayName,
-                        mimeType = currentPreview.mimeType,
-                        imagePaths = currentPreview.imagePaths,
-                        extractedText = currentPreview.extractedText,
-                    )
                 }
             }
             val destination = withContext(Dispatchers.IO) {
@@ -315,7 +369,7 @@ class OrganizerRuntime(private val app: Application) {
         }
     }
 
-    private fun handleDownloadStatus(status: DownloadStatus) {
+    private fun handleDownloadStatus(model: OrganizerModel, status: DownloadStatus) {
         when (status) {
             DownloadStatus.Idle -> Unit
             is DownloadStatus.Progress -> _uiState.update {
@@ -323,7 +377,7 @@ class OrganizerRuntime(private val app: Application) {
                     downloading = true,
                     downloadBytes = status.bytes,
                     downloadTotal = status.total,
-                    statusMessage = "Downloading Gemma 4 E2B… ${formatBytes(status.bytes)} / ${formatBytes(status.total)}",
+                    statusMessage = "Downloading ${model.displayName}… ${formatBytes(status.bytes)} / ${formatBytes(status.total)}",
                 )
             }
             is DownloadStatus.Ready -> _uiState.update {
@@ -331,8 +385,8 @@ class OrganizerRuntime(private val app: Application) {
                     downloading = false,
                     modelReady = true,
                     downloadBytes = status.path.let { path -> java.io.File(path).length() },
-                    downloadTotal = com.smartorganizer.agent.llm.ModelCatalog.EXPECTED_BYTES,
-                    statusMessage = "Gemma 4 E2B is saved on this phone. You can use it offline now.",
+                    downloadTotal = model.expectedBytes,
+                    statusMessage = "${model.displayName} is saved on this phone. You can use it offline now.",
                     errorMessage = null,
                 )
             }
@@ -347,5 +401,9 @@ class OrganizerRuntime(private val app: Application) {
         if (value < 1_000_000L) return "${value / 1024} KB"
         val mb = value / 1_000_000.0
         return if (mb >= 1000) String.format("%.2f GB", mb / 1000.0) else String.format("%.0f MB", mb)
+    }
+
+    companion object {
+        private const val MIN_OCR_CHARS = 12
     }
 }

@@ -74,4 +74,6 @@ dependencies {
     implementation(libs.androidx.documentfile)
     implementation(libs.okhttp)
     implementation(libs.litertlm)
+    implementation(libs.mlkit.text.recognition)
+    implementation(libs.kotlinx.coroutines.play.services)
 }

@@ -22,43 +22,65 @@ data class Classification(
 class GemmaClassifier {
     private var engine: Engine? = null
     private var visionEnabled: Boolean = false
+    private var loadedPath: String? = null
 
     val isReady: Boolean get() = engine != null
 
-    fun load(modelPath: String, cacheDir: String) {
+    fun isLoaded(path: String): Boolean = engine != null && loadedPath == path
+
+    fun load(model: OrganizerModel, modelPath: String, cacheDir: String) {
+        if (isLoaded(modelPath)) return
         close()
-        val attempts = listOf(
-            EngineConfig(
-                modelPath = modelPath,
-                backend = Backend.GPU(),
-                visionBackend = Backend.GPU(),
-                maxNumTokens = 4096,
-                maxNumImages = 2,
-                cacheDir = cacheDir,
-            ),
-            EngineConfig(
-                modelPath = modelPath,
-                backend = Backend.CPU(),
-                visionBackend = Backend.GPU(),
-                maxNumTokens = 4096,
-                maxNumImages = 2,
-                cacheDir = cacheDir,
-            ),
-            EngineConfig(
-                modelPath = modelPath,
-                backend = Backend.CPU(),
-                visionBackend = Backend.CPU(),
-                maxNumTokens = 4096,
-                maxNumImages = 2,
-                cacheDir = cacheDir,
-            ),
-            EngineConfig(
-                modelPath = modelPath,
-                backend = Backend.CPU(),
-                maxNumTokens = 4096,
-                cacheDir = cacheDir,
-            ),
-        )
+        val attempts = buildList {
+            if (model.supportsVision) {
+                add(
+                    EngineConfig(
+                        modelPath = modelPath,
+                        backend = Backend.GPU(),
+                        visionBackend = Backend.GPU(),
+                        maxNumTokens = 4096,
+                        maxNumImages = 2,
+                        cacheDir = cacheDir,
+                    ),
+                )
+                add(
+                    EngineConfig(
+                        modelPath = modelPath,
+                        backend = Backend.CPU(),
+                        visionBackend = Backend.GPU(),
+                        maxNumTokens = 4096,
+                        maxNumImages = 2,
+                        cacheDir = cacheDir,
+                    ),
+                )
+                add(
+                    EngineConfig(
+                        modelPath = modelPath,
+                        backend = Backend.CPU(),
+                        visionBackend = Backend.CPU(),
+                        maxNumTokens = 4096,
+                        maxNumImages = 2,
+                        cacheDir = cacheDir,
+                    ),
+                )
+            }
+            add(
+                EngineConfig(
+                    modelPath = modelPath,
+                    backend = Backend.GPU(),
+                    maxNumTokens = 4096,
+                    cacheDir = cacheDir,
+                ),
+            )
+            add(
+                EngineConfig(
+                    modelPath = modelPath,
+                    backend = Backend.CPU(),
+                    maxNumTokens = 4096,
+                    cacheDir = cacheDir,
+                ),
+            )
+        }
 
         var lastError: Exception? = null
         for (config in attempts) {
@@ -67,13 +89,14 @@ class GemmaClassifier {
                 candidate.initialize()
                 engine = candidate
                 visionEnabled = config.visionBackend != null
+                loadedPath = modelPath
                 return
             } catch (error: Exception) {
                 lastError = error
                 runCatching { candidate.close() }
             }
         }
-        throw lastError ?: IllegalStateException("Could not initialize Gemma 4 E2B.")
+        throw lastError ?: IllegalStateException("Could not initialize ${model.displayName}.")
     }
 
     fun classify(
@@ -82,7 +105,7 @@ class GemmaClassifier {
         imagePaths: List<String>,
         extractedText: String,
     ): Classification {
-        val current = engine ?: error("Gemma 4 is not loaded yet.")
+        val current = engine ?: error("The selected model is not loaded yet.")
         val contents = buildContents(fileName, mimeType, imagePaths, extractedText)
         val conversation = current.createConversation(
             ConversationConfig(
@@ -104,6 +127,7 @@ class GemmaClassifier {
         val current = engine
         engine = null
         visionEnabled = false
+        loadedPath = null
         if (current != null) {
             runCatching { current.close() }
         }
@@ -120,10 +144,12 @@ class GemmaClassifier {
             appendLine("File name: $fileName")
             appendLine("MIME type: ${mimeType.ifBlank { "unknown" }}")
             if (extractedText.isNotBlank()) {
-                appendLine("Extracted text:")
+                appendLine("ML Kit OCR text:")
                 appendLine(extractedText.take(2500))
+            } else {
+                appendLine("ML Kit found no readable text.")
             }
-            if (imagePaths.isNotEmpty()) {
+            if (visionEnabled && imagePaths.isNotEmpty()) {
                 appendLine("One or more page/photo images are attached.")
             }
             appendLine("Reply with JSON only.")
@@ -151,14 +177,14 @@ class GemmaClassifier {
             parsed?.optString("folder")?.ifBlank { parsed.optString("category") },
         )
         val confidence = parsed?.optDouble("confidence", 0.6)?.toFloat()?.coerceIn(0f, 1f) ?: 0.55f
-        val reason = parsed?.optString("reason").orEmpty().ifBlank { "Gemma 4 classification" }
+        val reason = parsed?.optString("reason").orEmpty().ifBlank { "On-device classification" }
         val finalCategory = if (confidence < 0.45f) DocumentCategory.REVIEW else category
         return Classification(finalCategory, confidence, reason, raw)
     }
 
     companion object {
         private val SYSTEM_PROMPT = """
-            You are an on-device document organizer. Look at the file name, any attached images, and any extracted text.
+            You are an on-device document organizer. Use the file name, ML Kit OCR text, and any attached images.
             Choose exactly one folder from: Resume, Ticket, Bill, ID, Notes, Screenshot, Photo, Other.
 
             Rules:
@@ -172,6 +198,7 @@ class GemmaClassifier {
             - Other: anything else.
 
             A ticket photo and a ticket PDF both go to Ticket. A resume PDF goes to Resume.
+            If there is no OCR text and the file is a camera image, choose Photo unless it is clearly a document.
             Reply with JSON only, no markdown:
             {"folder":"Ticket","confidence":0.86,"reason":"boarding pass"}
         """.trimIndent()

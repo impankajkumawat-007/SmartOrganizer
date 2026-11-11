@@ -4,7 +4,6 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.pdf.PdfRenderer
-import android.net.Uri
 import android.os.ParcelFileDescriptor
 import android.webkit.MimeTypeMap
 import androidx.documentfile.provider.DocumentFile
@@ -23,8 +22,11 @@ data class FilePreview(
     }
 }
 
-class DocumentPreview(private val context: Context) {
-    fun prepare(document: DocumentFile): FilePreview {
+class DocumentPreview(
+    private val context: Context,
+    private val ocr: MlKitTextReader = MlKitTextReader(),
+) {
+    suspend fun prepare(document: DocumentFile): FilePreview {
         val name = document.name ?: "unnamed"
         val mime = document.type
             ?: MimeTypeMap.getSingleton().getMimeTypeFromExtension(name.substringAfterLast('.', ""))
@@ -36,11 +38,16 @@ class DocumentPreview(private val context: Context) {
             when {
                 mime.startsWith("image/") -> {
                     val image = renderImage(source, File(workDir, "page-${System.nanoTime()}.png"))
-                    FilePreview(name, mime, listOfNotNull(image), "")
+                    FilePreview(name, mime, listOfNotNull(image?.path), image?.text.orEmpty())
                 }
                 mime == "application/pdf" || name.endsWith(".pdf", true) -> {
                     val pages = renderPdf(source, workDir)
-                    FilePreview(name, "application/pdf", pages, "")
+                    FilePreview(
+                        name,
+                        "application/pdf",
+                        pages.map { it.path },
+                        pages.map { it.text }.filter { it.isNotBlank() }.joinToString("\n"),
+                    )
                 }
                 mime.startsWith("text/") || TEXT_EXTENSIONS.any { name.endsWith(it, true) } -> {
                     FilePreview(name, mime, emptyList(), source.readText().take(2500))
@@ -59,14 +66,15 @@ class DocumentPreview(private val context: Context) {
         return destination
     }
 
-    private fun renderImage(source: File, destination: File): String? {
+    private suspend fun renderImage(source: File, destination: File): PagePreview? {
         val original = decodeDownsampled(source) ?: return null
         writePng(original, destination)
+        val text = ocr.read(original)
         original.recycle()
-        return destination.absolutePath
+        return PagePreview(destination.absolutePath, text)
     }
 
-    private fun renderPdf(source: File, workDir: File): List<String> {
+    private suspend fun renderPdf(source: File, workDir: File): List<PagePreview> {
         val descriptor = ParcelFileDescriptor.open(source, ParcelFileDescriptor.MODE_READ_ONLY)
         return PdfRenderer(descriptor).use { renderer ->
             val count = minOf(renderer.pageCount, 2)
@@ -81,8 +89,9 @@ class DocumentPreview(private val context: Context) {
                     page.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
                     val out = File(workDir, "pdf-${System.nanoTime()}-$index.png")
                     writePng(bitmap, out)
+                    val text = ocr.read(bitmap)
                     bitmap.recycle()
-                    out.absolutePath
+                    PagePreview(out.absolutePath, text)
                 }
             }
         }.also {
@@ -106,6 +115,8 @@ class DocumentPreview(private val context: Context) {
             bitmap.compress(Bitmap.CompressFormat.PNG, 100, output)
         }
     }
+
+    private data class PagePreview(val path: String, val text: String)
 
     companion object {
         private val TEXT_EXTENSIONS = listOf(".txt", ".md", ".csv", ".json", ".xml", ".log")

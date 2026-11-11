@@ -29,6 +29,11 @@ import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.ExposedDropdownMenuBox
+import androidx.compose.material3.ExposedDropdownMenuDefaults
+import androidx.compose.material3.MenuAnchorType
 import androidx.compose.material3.Icon
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
@@ -39,6 +44,9 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -49,6 +57,8 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.smartorganizer.agent.data.OrganizedFile
+import com.smartorganizer.agent.llm.ModelCatalog
+import com.smartorganizer.agent.llm.OrganizerModel
 import com.smartorganizer.agent.runtime.OrganizerUiState
 import com.smartorganizer.agent.ui.theme.Danger
 import com.smartorganizer.agent.ui.theme.Gold
@@ -92,6 +102,7 @@ fun HomeRoute(viewModel: OrganizerViewModel = viewModel()) {
 
     HomeScreen(
         state = state,
+        onSelectModel = viewModel::setSelectedModel,
         onTokenChange = viewModel::setHuggingFaceToken,
         onDownload = viewModel::startDownload,
         onCancelDownload = viewModel::cancelDownload,
@@ -109,6 +120,7 @@ fun HomeRoute(viewModel: OrganizerViewModel = viewModel()) {
 @Composable
 private fun HomeScreen(
     state: OrganizerUiState,
+    onSelectModel: (OrganizerModel) -> Unit,
     onTokenChange: (String) -> Unit,
     onDownload: () -> Unit,
     onCancelDownload: () -> Unit,
@@ -129,14 +141,14 @@ private fun HomeScreen(
             Column {
                 Text("Smart Organizer", style = MaterialTheme.typography.headlineLarge, color = Ink)
                 Text(
-                    "Drop files into one folder. Gemma 4 reads what they mean and files them.",
+                    "Drop files into one folder. ML Kit reads text; the selected model files them by meaning.",
                     style = MaterialTheme.typography.bodyLarge,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
 
             FailureBanner(state)
-            ModelCard(state, onTokenChange, onDownload, onCancelDownload, onImportModel)
+            ModelCard(state, onSelectModel, onTokenChange, onDownload, onCancelDownload, onImportModel)
             FolderCard(state, onPickFolder, onToggleWatch)
             HistoryCard(state.recentFiles)
             Spacer(Modifier.height(24.dp))
@@ -144,22 +156,62 @@ private fun HomeScreen(
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun ModelCard(
     state: OrganizerUiState,
+    onSelectModel: (OrganizerModel) -> Unit,
     onTokenChange: (String) -> Unit,
     onDownload: () -> Unit,
     onCancelDownload: () -> Unit,
     onImportModel: () -> Unit,
 ) {
-    SectionCard(icon = Icons.Outlined.Memory, title = "Gemma 4 E2B") {
+    var expanded by remember { mutableStateOf(false) }
+    val model = state.selectedModel
+    SectionCard(icon = Icons.Outlined.Memory, title = "On-device model") {
         Text(
-            if (state.modelReady) "Saved on this phone. Inference stays offline."
-            else "One-time 2.6 GB download from Hugging Face. Not packed inside the app.",
+            "ML Kit OCR runs on every image and PDF. Pick a model, then download it once like before.",
             style = MaterialTheme.typography.bodyMedium,
         )
+        ExposedDropdownMenuBox(
+            expanded = expanded,
+            onExpandedChange = { if (!state.downloading && !state.watching) expanded = it },
+        ) {
+            OutlinedTextField(
+                value = "${model.displayName}  ·  ${model.displaySize}",
+                onValueChange = {},
+                readOnly = true,
+                enabled = !state.downloading && !state.watching,
+                label = { Text("Selected model") },
+                trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded) },
+                modifier = Modifier
+                    .menuAnchor(MenuAnchorType.PrimaryNotEditable, enabled = !state.downloading && !state.watching)
+                    .fillMaxWidth(),
+            )
+            ExposedDropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+                ModelCatalog.all.forEach { option ->
+                    DropdownMenuItem(
+                        text = {
+                            Column {
+                                Text("${option.displayName}  ·  ${option.displaySize}")
+                                Text(
+                                    if (option.supportsVision) "Vision + OCR" else "OCR text only",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                        },
+                        onClick = {
+                            onSelectModel(option)
+                            expanded = false
+                        },
+                    )
+                }
+            }
+        }
+        Text(model.summary, style = MaterialTheme.typography.bodyMedium)
         if (state.modelReady) {
-            StatusRow("Model ready", Moss)
+            StatusRow("${model.displayName} ready", Moss)
         }
         if (state.engineReady) {
             StatusRow("Loaded in memory", Moss)

@@ -51,7 +51,11 @@ class OrganizerService : LifecycleService() {
                     }
                 val processing = runtime.uiState.value.processingName
                 updateNotification(
-                    if (processing != null) "Sorting $processing" else "Watching the inbox with Gemma 4",
+                    if (processing != null) {
+                        "Sorting $processing"
+                    } else {
+                        "Watching the inbox with ${runtime.uiState.value.selectedModel.displayName}"
+                    }
                 )
                 delay(POLL_MS)
             }

@@ -36,13 +36,15 @@ class ModelDownloader(private val context: Context) {
 
     private val cancelRequested = AtomicBoolean(false)
 
-    fun modelFile(): File = File(File(context.filesDir, "models").apply { mkdirs() }, ModelCatalog.FILE_NAME)
+    fun modelsDir(): File = File(context.filesDir, "models").apply { mkdirs() }
 
-    fun partialFile(): File = File(modelFile().parentFile, "${ModelCatalog.FILE_NAME}.part")
+    fun modelFile(model: OrganizerModel): File = File(modelsDir(), model.fileName)
 
-    fun currentStatus(): DownloadStatus {
-        val file = modelFile()
-        return if (file.exists() && ModelCatalog.isComplete(file.length())) {
+    fun partialFile(model: OrganizerModel): File = File(modelsDir(), "${model.fileName}.part")
+
+    fun currentStatus(model: OrganizerModel): DownloadStatus {
+        val file = modelFile(model)
+        return if (file.exists() && model.isComplete(file.length())) {
             DownloadStatus.Ready(file.absolutePath)
         } else {
             DownloadStatus.Idle
@@ -53,18 +55,18 @@ class ModelDownloader(private val context: Context) {
         cancelRequested.set(true)
     }
 
-    fun download(token: String): Flow<DownloadStatus> = flow {
+    fun download(model: OrganizerModel, token: String): Flow<DownloadStatus> = flow {
         cancelRequested.set(false)
-        val destination = modelFile()
-        if (destination.exists() && ModelCatalog.isComplete(destination.length())) {
+        val destination = modelFile(model)
+        if (destination.exists() && model.isComplete(destination.length())) {
             emit(DownloadStatus.Ready(destination.absolutePath))
             return@flow
         }
 
-        val part = partialFile()
+        val part = partialFile(model)
         var downloaded = if (part.exists()) part.length() else 0L
         val requestBuilder = Request.Builder()
-            .url(ModelCatalog.DOWNLOAD_URL)
+            .url(model.downloadUrl)
             .header("User-Agent", "SmartOrganizer/1.0")
             .header("Accept", "*/*")
         if (token.isNotBlank()) {
@@ -79,7 +81,7 @@ class ModelDownloader(private val context: Context) {
             response.close()
             emit(
                 DownloadStatus.Failed(
-                    "Hugging Face blocked the download. Accept the Gemma license on the model page, then paste an access token.",
+                    "Hugging Face blocked ${model.displayName}. Accept the model license, then paste an access token.",
                 ),
             )
             return@flow
@@ -97,7 +99,7 @@ class ModelDownloader(private val context: Context) {
             ?: response.body?.contentLength()?.let { length ->
                 if (response.code == 206) downloaded + length else length
             }
-            ?: ModelCatalog.EXPECTED_BYTES
+            ?: model.expectedBytes
 
         if (response.code != 206) {
             downloaded = 0L
@@ -131,10 +133,10 @@ class ModelDownloader(private val context: Context) {
         }
         response.close()
 
-        if (!ModelCatalog.isComplete(part.length())) {
+        if (!model.isComplete(part.length())) {
             emit(
                 DownloadStatus.Failed(
-                    "Downloaded ${part.length()} bytes, expected ${ModelCatalog.EXPECTED_BYTES}. Try again to resume.",
+                    "Downloaded ${part.length()} bytes, expected ${model.expectedBytes}. Try again to resume.",
                 ),
             )
             return@flow
@@ -148,10 +150,10 @@ class ModelDownloader(private val context: Context) {
         emit(DownloadStatus.Ready(destination.absolutePath))
     }.flowOn(Dispatchers.IO)
 
-    fun importFrom(uri: Uri): Flow<DownloadStatus> = flow {
+    fun importFrom(model: OrganizerModel, uri: Uri): Flow<DownloadStatus> = flow {
         cancelRequested.set(false)
-        val destination = modelFile()
-        val part = partialFile()
+        val destination = modelFile(model)
+        val part = partialFile(model)
         if (part.exists()) part.delete()
 
         val resolver = context.contentResolver
@@ -165,9 +167,10 @@ class ModelDownloader(private val context: Context) {
             return@flow
         }
 
-        if (part.length() < 100_000_000L) {
+        val minimum = (model.expectedBytes * 0.8).toLong().coerceAtLeast(80_000_000L)
+        if (part.length() < minimum) {
             part.delete()
-            emit(DownloadStatus.Failed("That file is too small to be Gemma 4 E2B."))
+            emit(DownloadStatus.Failed("That file is too small to be ${model.displayName}."))
             return@flow
         }
         if (destination.exists()) destination.delete()
